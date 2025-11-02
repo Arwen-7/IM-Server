@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  # PostgreSQL数据库
+  postgres:
+    image: postgres:15-alpine
+    container_name: im-postgres
+    environment:
+      POSTGRES_DB: im_db
+      POSTGRES_USER: imserver
+      POSTGRES_PASSWORD: imserver123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - im-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imserver"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis缓存
+  redis:
+    image: redis:7-alpine
+    container_name: im-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - im-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # IM服务器
+  im-server:
+    build: .
+    container_name: im-server
+    ports:
+      - "8080:8080"  # HTTP API
+      - "8081:8081"  # WebSocket
+      - "8082:8082"  # TCP
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - im-network
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  im-network:
+    driver: bridge
+

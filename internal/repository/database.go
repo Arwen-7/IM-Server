@@ -1,0 +1,94 @@
+package repository
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/arwen/im-server/internal/model"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+var DB *gorm.DB
+
+// DatabaseConfig 数据库配置
+type DatabaseConfig struct {
+	Type            string
+	Host            string
+	Port            int
+	User            string
+	Password        string
+	DBName          string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime int
+}
+
+// InitDatabase 初始化数据库
+func InitDatabase(config *DatabaseConfig) error {
+	var dialector gorm.Dialector
+
+	switch config.Type {
+	case "mysql":
+		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+			config.User, config.Password, config.Host, config.Port, config.DBName)
+		dialector = mysql.Open(dsn)
+	case "postgres":
+		dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%d sslmode=disable TimeZone=Asia/Shanghai",
+			config.Host, config.User, config.Password, config.DBName, config.Port)
+		dialector = postgres.Open(dsn)
+	default:
+		return fmt.Errorf("unsupported database type: %s", config.Type)
+	}
+
+	db, err := gorm.Open(dialector, &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to connect database: %w", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to get database instance: %w", err)
+	}
+
+	// 设置连接池
+	sqlDB.SetMaxOpenConns(config.MaxOpenConns)
+	sqlDB.SetMaxIdleConns(config.MaxIdleConns)
+	sqlDB.SetConnMaxLifetime(time.Duration(config.ConnMaxLifetime) * time.Minute)
+
+	DB = db
+
+	// 自动迁移
+	if err := autoMigrate(); err != nil {
+		return fmt.Errorf("failed to migrate database: %w", err)
+	}
+
+	return nil
+}
+
+// autoMigrate 自动迁移
+func autoMigrate() error {
+	return DB.AutoMigrate(
+		&model.User{},
+		&model.UserSession{},
+		&model.OnlineStatus{},
+		&model.Message{},
+		&model.MessageSequence{},
+		&model.MessageReadReceipt{},
+		&model.Conversation{},
+		&model.Friend{},
+		&model.FriendRequest{},
+		&model.Group{},
+		&model.GroupMember{},
+	)
+}
+
+// GetDB 获取数据库实例
+func GetDB() *gorm.DB {
+	return DB
+}
+
