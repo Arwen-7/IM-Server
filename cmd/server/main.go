@@ -85,6 +85,18 @@ func main() {
 		conversationService,
 	)
 
+	// 创建TCP服务器（默认传输协议）
+	tcpServer := transport.NewTCPServer(connManager, messageHandler)
+
+	// 启动TCP服务器
+	tcpAddr := fmt.Sprintf(":%d", config.Server.TCPPort)
+	go func() {
+		logger.Info("TCP server starting", zap.String("addr", tcpAddr))
+		if err := tcpServer.Start(tcpAddr); err != nil {
+			logger.Fatal("Failed to start TCP server", zap.Error(err))
+		}
+	}()
+
 	// 创建WebSocket服务器
 	wsServer := transport.NewWebSocketServer(connManager, messageHandler)
 
@@ -110,9 +122,8 @@ func main() {
 		}
 	}()
 
-	// TODO: 启动TCP服务器
-
 	logger.Info("IM Server started successfully",
+		zap.Int("tcp_port", config.Server.TCPPort),
 		zap.Int("ws_port", config.Server.WSPort),
 		zap.Int("http_port", config.Server.HTTPPort))
 

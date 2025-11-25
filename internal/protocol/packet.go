@@ -14,14 +14,15 @@ const (
 	ProtocolVersion = 1
 )
 
-// PacketHeader 包头
+// PacketHeader 包头（与客户端格式一致）
 type PacketHeader struct {
-	Magic    uint16 // 2字节：魔数
+	Magic    uint16 // 2字节：魔数 0xEF89
 	Version  uint8  // 1字节：版本
+	Flags    uint8  // 1字节：标志位（预留，用于扩展：加密、压缩等）
 	Command  uint16 // 2字节：命令类型
 	Sequence uint32 // 4字节：序列号
 	BodyLen  uint32 // 4字节：包体长度
-	Reserved [3]byte // 3字节：保留
+	CRC16    uint16 // 2字节：CRC16校验值（校验前14字节）
 }
 
 // Packet 数据包
@@ -30,16 +31,40 @@ type Packet struct {
 	Body   []byte
 }
 
+// CRC16 计算CRC16校验值（CRC-16/CCITT-FALSE）
+func CRC16(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	polynomial := uint16(0x1021)
+	
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ polynomial
+			} else {
+				crc = crc << 1
+			}
+		}
+	}
+	
+	return crc
+}
+
 // EncodePacketHeader 编码包头
 func EncodePacketHeader(header *PacketHeader) []byte {
 	buf := make([]byte, PacketHeaderSize)
 	
+	// 前14字节（用于CRC计算）
 	binary.BigEndian.PutUint16(buf[0:2], header.Magic)
 	buf[2] = header.Version
-	binary.BigEndian.PutUint16(buf[3:5], header.Command)
-	binary.BigEndian.PutUint32(buf[5:9], header.Sequence)
-	binary.BigEndian.PutUint32(buf[9:13], header.BodyLen)
-	copy(buf[13:16], header.Reserved[:])
+	buf[3] = header.Flags
+	binary.BigEndian.PutUint16(buf[4:6], header.Command)
+	binary.BigEndian.PutUint32(buf[6:10], header.Sequence)
+	binary.BigEndian.PutUint32(buf[10:14], header.BodyLen)
+	
+	// 计算CRC16（校验前14字节）
+	crc := CRC16(buf[:14])
+	binary.BigEndian.PutUint16(buf[14:16], crc)
 	
 	return buf
 }
@@ -53,11 +78,12 @@ func DecodePacketHeader(data []byte) (*PacketHeader, error) {
 	header := &PacketHeader{
 		Magic:    binary.BigEndian.Uint16(data[0:2]),
 		Version:  data[2],
-		Command:  binary.BigEndian.Uint16(data[3:5]),
-		Sequence: binary.BigEndian.Uint32(data[5:9]),
-		BodyLen:  binary.BigEndian.Uint32(data[9:13]),
+		Flags:    data[3],
+		Command:  binary.BigEndian.Uint16(data[4:6]),
+		Sequence: binary.BigEndian.Uint32(data[6:10]),
+		BodyLen:  binary.BigEndian.Uint32(data[10:14]),
+		CRC16:    binary.BigEndian.Uint16(data[14:16]),
 	}
-	copy(header.Reserved[:], data[13:16])
 	
 	// 验证魔数
 	if header.Magic != MagicNumber {
@@ -69,6 +95,12 @@ func DecodePacketHeader(data []byte) (*PacketHeader, error) {
 		return nil, errors.New("unsupported protocol version")
 	}
 	
+	// 验证CRC16（校验前14字节）
+	calculatedCRC := CRC16(data[:14])
+	if calculatedCRC != header.CRC16 {
+		return nil, errors.New("invalid CRC16 checksum")
+	}
+	
 	return header, nil
 }
 
@@ -77,6 +109,7 @@ func EncodePacket(command uint16, sequence uint32, body []byte) []byte {
 	header := &PacketHeader{
 		Magic:    MagicNumber,
 		Version:  ProtocolVersion,
+		Flags:    0, // 默认无标志
 		Command:  command,
 		Sequence: sequence,
 		BodyLen:  uint32(len(body)),

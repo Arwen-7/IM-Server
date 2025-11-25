@@ -78,6 +78,7 @@ func autoMigrate() error {
 		&model.OnlineStatus{},
 		&model.Message{},
 		&model.MessageSequence{},
+		&model.GlobalSequence{},
 		&model.MessageReadReceipt{},
 		&model.Conversation{},
 		&model.Friend{},
