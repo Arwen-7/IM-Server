@@ -13,10 +13,11 @@ import (
 
 // MessageHandler 消息处理器
 type MessageHandler struct {
-	connManager *transport.ConnectionManager
-	userService *service.UserService
-	msgService  *service.MessageService
-	convService *service.ConversationService
+	connManager  *transport.ConnectionManager
+	userService  *service.UserService
+	msgService   *service.MessageService
+	convService  *service.ConversationService
+	groupService *service.GroupService
 }
 
 // NewMessageHandler 创建消息处理器
@@ -25,12 +26,14 @@ func NewMessageHandler(
 	userService *service.UserService,
 	msgService *service.MessageService,
 	convService *service.ConversationService,
+	groupService *service.GroupService,
 ) *MessageHandler {
 	return &MessageHandler{
-		connManager: connManager,
-		userService: userService,
-		msgService:  msgService,
-		convService: convService,
+		connManager:  connManager,
+		userService:  userService,
+		msgService:   msgService,
+		convService:  convService,
+		groupService: groupService,
 	}
 }
 
@@ -42,12 +45,12 @@ func (h *MessageHandler) HandleTCPPacket(conn transport.Connection, packet *prot
 		Sequence: packet.Header.Sequence,
 		Body:     packet.Body,
 	}
-	
+
 	logger.Debug("Received TCP message",
 		zap.String("conn_id", conn.GetID()),
 		zap.Uint16("command", packet.Header.Command),
 		zap.Uint32("sequence", packet.Header.Sequence))
-	
+
 	return h.handleMessage(conn, wsMsg)
 }
 
@@ -59,12 +62,12 @@ func (h *MessageHandler) HandleMessage(conn transport.Connection, data []byte) e
 		logger.Error("Failed to unmarshal WebSocket message", zap.Error(err))
 		return err
 	}
-	
+
 	logger.Debug("Received WebSocket message",
 		zap.String("conn_id", conn.GetID()),
 		zap.String("command", wsMsg.Command.String()),
 		zap.Uint32("sequence", wsMsg.Sequence))
-	
+
 	return h.handleMessage(conn, wsMsg)
 }
 
@@ -211,7 +214,7 @@ func (h *MessageHandler) handleSendMessage(conn transport.Connection, wsMsg *pro
 		GroupID:        msgInfo.GroupId,
 		MessageType:    int(msgInfo.MessageType),
 		Content:        string(msgInfo.Content),
-		SendTime:       msgInfo.SendTime,  // ✅ 统一使用 sendTime
+		SendTime:       msgInfo.SendTime, // ✅ 统一使用 sendTime
 		ServerTime:     now,
 		Status:         1, // 已发送
 		// Seq 由 SaveMessage 内部分配
@@ -232,12 +235,12 @@ func (h *MessageHandler) handleSendMessage(conn transport.Connection, wsMsg *pro
 
 	// 发送响应（返回服务端生成的 ID 和 Seq）
 	resp := &protocol.SendMessageResponse{
-		ErrorCode:    protocol.ERR_SUCCESS,
-		ErrorMsg:     "Success",
-		ServerMsgId:  msg.ServerMsgID,     // ✅ 服务端生成的消息 ID（全局唯一）
-		ClientMsgId:  msg.ClientMsgID,     // ✅ 客户端消息 ID（用于匹配本地消息）
-		Seq:          msg.Seq,             // ✅ 会话内的序列号（全局有序）
-		ServerTime:   now,
+		ErrorCode:   protocol.ERR_SUCCESS,
+		ErrorMsg:    "Success",
+		ServerMsgId: msg.ServerMsgID, // ✅ 服务端生成的消息 ID（全局唯一）
+		ClientMsgId: msg.ClientMsgID, // ✅ 客户端消息 ID（用于匹配本地消息）
+		Seq:         msg.Seq,         // ✅ 会话内的序列号（全局有序）
+		ServerTime:  now,
 	}
 	if err := h.sendResponse(conn, protocol.CMD_SEND_MSG_RSP, wsMsg.Sequence, resp); err != nil {
 		return err
@@ -245,16 +248,27 @@ func (h *MessageHandler) handleSendMessage(conn transport.Connection, wsMsg *pro
 
 	// 推送给接收者
 	if msgInfo.ReceiverId != "" {
+		// 单聊消息：推送给接收者
 		h.pushMessageToUser(msgInfo.ReceiverId, msg)
+		logger.Info("Message sent (single chat)",
+			zap.String("server_msg_id", msg.ServerMsgID),
+			zap.String("client_msg_id", msg.ClientMsgID),
+			zap.Int64("seq", msg.Seq),
+			zap.String("conversation_id", msg.ConversationID),
+			zap.String("sender", userID),
+			zap.String("receiver", msgInfo.ReceiverId))
+	} else if msgInfo.GroupId != "" {
+		// 群聊消息：推送给群组所有成员（除了发送者）
+		h.pushMessageToGroup(msgInfo.GroupId, userID, msg)
+		logger.Info("Message sent (group chat)",
+			zap.String("server_msg_id", msg.ServerMsgID),
+			zap.String("client_msg_id", msg.ClientMsgID),
+			zap.Int64("seq", msg.Seq),
+			zap.String("conversation_id", msg.ConversationID),
+			zap.String("sender", userID),
+			zap.String("group_id", msgInfo.GroupId))
 	}
 
-	logger.Info("Message sent", 
-		zap.String("server_msg_id", msg.ServerMsgID),
-		zap.String("client_msg_id", msg.ClientMsgID), 
-		zap.Int64("seq", msg.Seq),
-		zap.String("conversation_id", msg.ConversationID),
-		zap.String("sender", userID), 
-		zap.String("receiver", msgInfo.ReceiverId))
 	return nil
 }
 
@@ -281,8 +295,8 @@ func (h *MessageHandler) handleBatchSync(conn transport.Connection, wsMsg *proto
 		maxCountPerConv = 100
 	}
 
-	logger.Info("Batch sync request", 
-		zap.String("user_id", userID), 
+	logger.Info("Batch sync request",
+		zap.String("user_id", userID),
 		zap.Int("conversation_count", len(req.ConversationStates)),
 		zap.Int("max_count_per_conv", maxCountPerConv))
 
@@ -313,14 +327,14 @@ func (h *MessageHandler) handleBatchSync(conn transport.Connection, wsMsg *proto
 		for i, msg := range result.Messages {
 			messageIDs[i] = msg.ClientMsgID
 		}
-		
+
 		// 批量查询已读状态
 		readStatusMap, err := h.msgService.CheckMessagesReadStatus(messageIDs, userID)
 		if err != nil {
 			logger.Error("Failed to check read status", zap.Error(err))
 			readStatusMap = make(map[string]bool)
 		}
-		
+
 		// 转换消息
 		var messageInfoList []*protocol.MessageInfo
 		for _, msg := range result.Messages {
@@ -328,22 +342,31 @@ func (h *MessageHandler) handleBatchSync(conn transport.Connection, wsMsg *proto
 			if msg.SenderID == userID {
 				isRead = true
 			}
-			
+
+			// 推断会话类型
+			var conversationType int32
+			if msg.GroupID != "" {
+				conversationType = 2 // 群聊
+			} else {
+				conversationType = 1 // 单聊
+			}
+
 			msgInfo := &protocol.MessageInfo{
-				ServerMsgId:    msg.ServerMsgID,
-				ClientMsgId:    msg.ClientMsgID,
-				ConversationId: msg.ConversationID,
-				SenderId:       msg.SenderID,
-				ReceiverId:     msg.ReceiverID,  // ✅ 添加 ReceiverId
-				GroupId:        msg.GroupID,      // ✅ 添加 GroupId
-				Seq:            msg.Seq,
-				MessageType:    int32(msg.MessageType),
-				Content:        []byte(msg.Content),
-				SendTime:       msg.SendTime,
-				ServerTime:     msg.ServerTime,
-				CreateTime:     msg.SendTime,
-				Status:         int32(msg.Status),
-				IsRead:         isRead,
+				ServerMsgId:      msg.ServerMsgID,
+				ClientMsgId:      msg.ClientMsgID,
+				ConversationId:   msg.ConversationID,
+				ConversationType: conversationType, // ✅ 添加 ConversationType
+				SenderId:         msg.SenderID,
+				ReceiverId:       msg.ReceiverID,
+				GroupId:          msg.GroupID,
+				Seq:              msg.Seq,
+				MessageType:      int32(msg.MessageType),
+				Content:          []byte(msg.Content),
+				SendTime:         msg.SendTime,
+				ServerTime:       msg.ServerTime,
+				CreateTime:       msg.SendTime,
+				Status:           int32(msg.Status),
+				IsRead:           isRead,
 			}
 			messageInfoList = append(messageInfoList, msgInfo)
 		}
@@ -355,7 +378,7 @@ func (h *MessageHandler) handleBatchSync(conn transport.Connection, wsMsg *proto
 			SyncedSeq:      result.SyncedSeq,
 			HasMore:        result.HasMore,
 		})
-		
+
 		totalMessageCount += len(messageInfoList)
 	}
 
@@ -367,8 +390,8 @@ func (h *MessageHandler) handleBatchSync(conn transport.Connection, wsMsg *proto
 		TotalMessageCount:    int32(totalMessageCount),
 	}
 
-	logger.Info("Batch sync response", 
-		zap.String("user_id", userID), 
+	logger.Info("Batch sync response",
+		zap.String("user_id", userID),
 		zap.Int("conversation_count", len(conversationMessagesList)),
 		zap.Int("total_message_count", totalMessageCount))
 
@@ -418,7 +441,7 @@ func (h *MessageHandler) handleReadReceipt(conn transport.Connection, wsMsg *pro
 			return h.sendResponse(conn, protocol.CommandType_CMD_READ_RECEIPT_RSP, wsMsg.Sequence, resp)
 		}
 		messageIDs = unreadMessageIDs
-		logger.Debug("Mark all unread messages in conversation", 
+		logger.Debug("Mark all unread messages in conversation",
 			zap.String("conversation_id", req.ConversationId),
 			zap.Int("count", len(messageIDs)))
 	}
@@ -461,7 +484,7 @@ func (h *MessageHandler) handleReadReceipt(conn transport.Connection, wsMsg *pro
 func (h *MessageHandler) pushReadReceiptToOthers(conversationID string, messageIDs []string, readerUserID string, readTime int64) {
 	// 创建推送消息
 	push := &protocol.ReadReceiptPush{
-		ServerMsgIds:    messageIDs,  // ✅ 使用 ServerMsgIds
+		ServerMsgIds:   messageIDs, // ✅ 使用 ServerMsgIds
 		ConversationId: conversationID,
 		UserId:         readerUserID,
 		ReadTime:       readTime,
@@ -569,8 +592,8 @@ func (h *MessageHandler) handleSyncRange(conn transport.Connection, wsMsg *proto
 		return h.sendResponse(conn, protocol.CommandType_CMD_SYNC_RANGE_RSP, wsMsg.Sequence, resp)
 	}
 
-	logger.Info("Range sync request", 
-		zap.String("user_id", userID), 
+	logger.Info("Range sync request",
+		zap.String("user_id", userID),
 		zap.String("request_id", req.RequestId),
 		zap.String("conversation_id", req.ConversationId),
 		zap.Int64("start_seq", req.StartSeq),
@@ -600,7 +623,7 @@ func (h *MessageHandler) handleSyncRange(conn transport.Connection, wsMsg *proto
 	for i, msg := range messages {
 		messageIDs[i] = msg.ClientMsgID
 	}
-	
+
 	// 批量查询已读状态
 	readStatusMap, err := h.msgService.CheckMessagesReadStatus(messageIDs, userID)
 	if err != nil {
@@ -613,21 +636,31 @@ func (h *MessageHandler) handleSyncRange(conn transport.Connection, wsMsg *proto
 		if msg.SenderID == userID {
 			isRead = true
 		}
+
+		// 推断会话类型
+		var conversationType int32
+		if msg.GroupID != "" {
+			conversationType = 2 // 群聊
+		} else {
+			conversationType = 1 // 单聊
+		}
+
 		msgInfo := &protocol.MessageInfo{
-			ServerMsgId:    msg.ServerMsgID,
-			ClientMsgId:    msg.ClientMsgID,
-			ConversationId: msg.ConversationID,
-			SenderId:       msg.SenderID,
-			ReceiverId:     msg.ReceiverID,
-			GroupId:        msg.GroupID,
-			MessageType:    int32(msg.MessageType),
-			Content:        []byte(msg.Content),
-			SendTime:       msg.SendTime,
-			ServerTime:     msg.ServerTime,
-			CreateTime:     msg.SendTime,
-			Status:         int32(msg.Status),
-			IsRead:         isRead,
-			Seq:            msg.Seq, // ✅ 包含 seq 字段
+			ServerMsgId:      msg.ServerMsgID,
+			ClientMsgId:      msg.ClientMsgID,
+			ConversationId:   msg.ConversationID,
+			ConversationType: conversationType, // ✅ 添加 ConversationType
+			SenderId:         msg.SenderID,
+			ReceiverId:       msg.ReceiverID,
+			GroupId:          msg.GroupID,
+			MessageType:      int32(msg.MessageType),
+			Content:          []byte(msg.Content),
+			SendTime:         msg.SendTime,
+			ServerTime:       msg.ServerTime,
+			CreateTime:       msg.SendTime,
+			Status:           int32(msg.Status),
+			IsRead:           isRead,
+			Seq:              msg.Seq, // ✅ 包含 seq 字段
 		}
 		messageInfoList = append(messageInfoList, msgInfo)
 	}
@@ -643,8 +676,8 @@ func (h *MessageHandler) handleSyncRange(conn transport.Connection, wsMsg *proto
 		HasMore:        hasMore,
 	}
 
-	logger.Info("Range sync response", 
-		zap.String("user_id", userID), 
+	logger.Info("Range sync response",
+		zap.String("user_id", userID),
 		zap.String("request_id", req.RequestId),
 		zap.Int("message_count", len(messageInfoList)),
 		zap.Int64("start_seq", actualStartSeq),
@@ -662,17 +695,17 @@ func (h *MessageHandler) sendResponse(conn transport.Connection, command protoco
 	}
 
 	var data []byte
-	
+
 	if conn.GetType() == transport.ConnectionTypeTCP {
 		// TCP 连接：使用自定义协议包格式
 		data = protocol.EncodePacket(uint16(command), sequence, body)
-		
+
 		logger.Debug("Sending TCP response",
 			zap.String("conn_id", conn.GetID()),
 			zap.Uint16("command", uint16(command)),
 			zap.Uint32("sequence", sequence),
 			zap.Int("body_len", len(body)))
-			
+
 	} else {
 		// WebSocket 连接：使用 WebSocket 消息格式
 		wsMsg := &protocol.WebSocketMessage{
@@ -686,7 +719,7 @@ func (h *MessageHandler) sendResponse(conn transport.Connection, command protoco
 		if err != nil {
 			return err
 		}
-		
+
 		logger.Debug("Sending WebSocket response",
 			zap.String("conn_id", conn.GetID()),
 			zap.String("command", command.String()),
@@ -699,20 +732,29 @@ func (h *MessageHandler) sendResponse(conn transport.Connection, command protoco
 
 // pushMessageToUser 推送消息给用户（✅ 使用 MessageInfo 结构）
 func (h *MessageHandler) pushMessageToUser(userID string, msg *model.Message) {
+	// 推断会话类型
+	var conversationType int32
+	if msg.GroupID != "" {
+		conversationType = 2 // 群聊
+	} else {
+		conversationType = 1 // 单聊
+	}
+
 	pushMsg := &protocol.PushMessage{
-		Message: &protocol.MessageInfo{  // ✅ 通过 Message 字段包装
-			ServerMsgId:    msg.ServerMsgID,  // ✅ 使用服务端消息ID
-			ClientMsgId:    msg.ClientMsgID,  // ✅ 客户端消息ID
-			ConversationId: msg.ConversationID,
-			SenderId:       msg.SenderID,
-			ReceiverId:     msg.ReceiverID,
-			GroupId:        msg.GroupID,
-			MessageType:    int32(msg.MessageType),
-			Content:        []byte(msg.Content),
-			SendTime:       msg.SendTime,    // 发送时间
-			ServerTime:     msg.ServerTime,  // 服务器时间
-			CreateTime:     msg.SendTime,    // ✅ 创建时间（使用发送时间）
-			Seq:            msg.Seq,
+		Message: &protocol.MessageInfo{ // ✅ 通过 Message 字段包装
+			ServerMsgId:      msg.ServerMsgID, // ✅ 使用服务端消息ID
+			ClientMsgId:      msg.ClientMsgID, // ✅ 客户端消息ID
+			ConversationId:   msg.ConversationID,
+			ConversationType: conversationType, // ✅ 添加 ConversationType
+			SenderId:         msg.SenderID,
+			ReceiverId:       msg.ReceiverID,
+			GroupId:          msg.GroupID,
+			MessageType:      int32(msg.MessageType),
+			Content:          []byte(msg.Content),
+			SendTime:         msg.SendTime,   // 发送时间
+			ServerTime:       msg.ServerTime, // 服务器时间
+			CreateTime:       msg.SendTime,   // ✅ 创建时间（使用发送时间）
+			Seq:              msg.Seq,
 		},
 	}
 
@@ -730,7 +772,7 @@ func (h *MessageHandler) pushMessageToUser(userID string, msg *model.Message) {
 	}
 
 	var data []byte
-	
+
 	if conn.GetType() == transport.ConnectionTypeTCP {
 		// TCP 连接：使用自定义协议包格式
 		data = protocol.EncodePacket(uint16(protocol.CMD_PUSH_MSG), 0, body)
@@ -756,6 +798,98 @@ func (h *MessageHandler) pushMessageToUser(userID string, msg *model.Message) {
 	}
 }
 
+// pushMessageToGroup 推送消息给群组所有成员（除了发送者）
+func (h *MessageHandler) pushMessageToGroup(groupID, senderID string, msg *model.Message) {
+	// 获取群组成员
+	members, err := h.groupService.GetGroupMembers(nil, groupID)
+	if err != nil {
+		logger.Error("Failed to get group members", zap.Error(err), zap.String("group_id", groupID))
+		return
+	}
+
+	// 推断会话类型
+	var conversationType int32
+	if msg.GroupID != "" {
+		conversationType = 2 // 群聊
+	} else {
+		conversationType = 1 // 单聊
+	}
+
+	pushMsg := &protocol.PushMessage{
+		Message: &protocol.MessageInfo{
+			ServerMsgId:      msg.ServerMsgID,
+			ClientMsgId:      msg.ClientMsgID,
+			ConversationId:   msg.ConversationID,
+			ConversationType: conversationType, // ✅ 添加 ConversationType
+			SenderId:         msg.SenderID,
+			ReceiverId:       msg.ReceiverID,
+			GroupId:          msg.GroupID,
+			MessageType:      int32(msg.MessageType),
+			Content:          []byte(msg.Content),
+			SendTime:         msg.SendTime,
+			ServerTime:       msg.ServerTime,
+			CreateTime:       msg.SendTime,
+			Seq:              msg.Seq,
+		},
+	}
+
+	body, err := proto.Marshal(pushMsg)
+	if err != nil {
+		logger.Error("Failed to marshal push message", zap.Error(err))
+		return
+	}
+
+	// 推送给所有成员（除了发送者）
+	pushCount := 0
+	for _, member := range members {
+		if member.ID == senderID {
+			continue // 跳过发送者
+		}
+
+		// 获取成员连接
+		conn, exists := h.connManager.GetUserConnection(member.ID)
+		if !exists {
+			continue // 成员不在线
+		}
+
+		var data []byte
+
+		if conn.GetType() == transport.ConnectionTypeTCP {
+			// TCP 连接
+			data = protocol.EncodePacket(uint16(protocol.CMD_PUSH_MSG), 0, body)
+		} else {
+			// WebSocket 连接
+			wsMsg := &protocol.WebSocketMessage{
+				Command:   protocol.CMD_PUSH_MSG,
+				Sequence:  0,
+				Body:      body,
+				Timestamp: utils.GetCurrentMillis(),
+			}
+
+			data, err = proto.Marshal(wsMsg)
+			if err != nil {
+				logger.Error("Failed to marshal websocket message", zap.Error(err))
+				continue
+			}
+		}
+
+		// 发送给成员
+		if err := conn.Send(data); err != nil {
+			logger.Warn("Failed to push message to group member",
+				zap.String("user_id", member.ID),
+				zap.String("group_id", groupID),
+				zap.Error(err))
+		} else {
+			pushCount++
+		}
+	}
+
+	logger.Info("Group message pushed",
+		zap.String("group_id", groupID),
+		zap.Int("member_count", len(members)),
+		zap.Int("push_count", pushCount))
+}
+
 // pushToUser 推送消息给指定用户的所有在线设备
 func (h *MessageHandler) pushToUser(userID string, command protocol.CommandType, body []byte) {
 	// 获取用户连接
@@ -767,7 +901,7 @@ func (h *MessageHandler) pushToUser(userID string, command protocol.CommandType,
 
 	var data []byte
 	var err error
-	
+
 	if conn.GetType() == transport.ConnectionTypeTCP {
 		// TCP 连接：使用自定义协议包格式
 		data = protocol.EncodePacket(uint16(command), 0, body)
@@ -789,9 +923,8 @@ func (h *MessageHandler) pushToUser(userID string, command protocol.CommandType,
 
 	// 发送给用户
 	if err := conn.Send(data); err != nil {
-		logger.Debug("Failed to push to user (user may be offline)", 
-			zap.String("user_id", userID), 
+		logger.Debug("Failed to push to user (user may be offline)",
+			zap.String("user_id", userID),
 			zap.String("command", command.String()))
 	}
 }
-

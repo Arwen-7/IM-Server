@@ -35,7 +35,11 @@ func NewHTTPHandler(
 func (h *HTTPHandler) RegisterRoutes(mux *http.ServeMux) {
 	// 健康检查
 	mux.HandleFunc("/health", h.HealthCheck)
-	
+
+	// 认证相关
+	mux.HandleFunc("/api/auth/register", h.Register)
+	mux.HandleFunc("/api/auth/login", h.Login)
+
 	// 用户相关
 	mux.HandleFunc("/api/user/info/", h.HandleUserInfo)
 }
@@ -88,6 +92,113 @@ func (h *HTTPHandler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// RegisterRequest 注册请求
+type RegisterRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Nickname string `json:"nickname"`
+}
+
+// LoginRequest 登录请求
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Platform string `json:"platform"`
+}
+
+// LoginResponse 登录响应
+type LoginResponse struct {
+	Token  string   `json:"token"`
+	UserID string   `json:"userID"`
+	User   *UserDTO `json:"user"`
+}
+
+// Register 用户注册
+func (h *HTTPHandler) Register(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		h.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req RegisterRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.Username == "" || req.Password == "" {
+		h.writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+
+	if req.Nickname == "" {
+		req.Nickname = req.Username
+	}
+
+	logger.Info("Register request", zap.String("username", req.Username))
+
+	// 调用 UserService 注册
+	user, err := h.userService.Register(req.Username, req.Password, req.Nickname)
+	if err != nil {
+		logger.Warn("Register failed", zap.String("username", req.Username), zap.Error(err))
+		h.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	logger.Info("Register success", zap.String("user_id", user.ID), zap.String("username", req.Username))
+
+	h.writeJSON(w, http.StatusOK, Response{
+		Code:    0,
+		Message: "Success",
+		Data:    toUserDTO(user),
+	})
+}
+
+// Login 用户登录
+func (h *HTTPHandler) Login(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		h.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+
+	if req.Username == "" || req.Password == "" {
+		h.writeError(w, http.StatusBadRequest, "username and password are required")
+		return
+	}
+
+	if req.Platform == "" {
+		req.Platform = "web"
+	}
+
+	logger.Info("Login request", zap.String("username", req.Username), zap.String("platform", req.Platform))
+
+	// 调用 UserService 登录
+	token, user, err := h.userService.Login(req.Username, req.Password, req.Platform)
+	if err != nil {
+		logger.Warn("Login failed", zap.String("username", req.Username), zap.Error(err))
+		h.writeError(w, http.StatusUnauthorized, "Invalid username or password")
+		return
+	}
+
+	logger.Info("Login success", zap.String("user_id", user.ID), zap.String("username", req.Username))
+
+	h.writeJSON(w, http.StatusOK, Response{
+		Code:    0,
+		Message: "Success",
+		Data: LoginResponse{
+			Token:  token,
+			UserID: user.ID,
+			User:   toUserDTO(user),
+		},
+	})
+}
+
 // HandleUserInfo 处理用户信息请求（统一处理 GET 和 POST）
 func (h *HTTPHandler) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
@@ -95,14 +206,14 @@ func (h *HTTPHandler) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
 		// 从 URL 路径中提取 userID
 		path := strings.TrimPrefix(r.URL.Path, "/api/user/info/")
 		userID := strings.Split(path, "/")[0]
-		
+
 		if userID == "" || userID == "batch" {
 			h.writeError(w, http.StatusBadRequest, "userID is required")
 			return
 		}
-		
+
 		h.getUserInfo(w, userID)
-		
+
 	} else if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/batch") {
 		// POST /api/user/info/batch
 		h.GetUsersInfo(w, r)
@@ -120,7 +231,7 @@ func (h *HTTPHandler) getUserInfo(w http.ResponseWriter, userID string) {
 	if err != nil {
 		// 如果用户不存在，创建一个临时用户（开发模式）
 		logger.Warn("User not found, creating temp user", zap.String("userID", userID), zap.Error(err))
-		
+
 		// 返回一个临时用户 DTO
 		tempUserDTO := &UserDTO{
 			UserID:     userID,
@@ -135,7 +246,7 @@ func (h *HTTPHandler) getUserInfo(w http.ResponseWriter, userID string) {
 			CreateTime: 0,
 			UpdateTime: 0,
 		}
-		
+
 		h.writeJSON(w, http.StatusOK, Response{
 			Code:    0,
 			Message: "Success",
@@ -146,7 +257,7 @@ func (h *HTTPHandler) getUserInfo(w http.ResponseWriter, userID string) {
 
 	// 转换为 UserDTO
 	userDTO := toUserDTO(user)
-	
+
 	h.writeJSON(w, http.StatusOK, Response{
 		Code:    0,
 		Message: "Success",
@@ -219,4 +330,3 @@ func (h *HTTPHandler) writeError(w http.ResponseWriter, statusCode int, message 
 		Message: message,
 	})
 }
-

@@ -73,6 +73,7 @@ func main() {
 	userService := service.NewUserService(config.Auth.JWTSecret)
 	messageService := service.NewMessageService()
 	conversationService := service.NewConversationService()
+	groupService := service.NewGroupService(repository.GetDB())
 
 	// 创建连接管理器
 	connManager := transport.NewConnectionManager()
@@ -83,6 +84,7 @@ func main() {
 		userService,
 		messageService,
 		conversationService,
+		groupService,
 	)
 
 	// 创建TCP服务器（默认传输协议）
@@ -111,10 +113,12 @@ func main() {
 
 	// 启动HTTP API服务器
 	httpHandler := handler.NewHTTPHandler(userService, messageService, conversationService)
+	groupHandler := handler.NewGroupHandler(groupService, userService)
 	httpAddr := fmt.Sprintf(":%d", config.Server.HTTPPort)
 	go func() {
 		mux := http.NewServeMux()
 		httpHandler.RegisterRoutes(mux)
+		groupHandler.RegisterRoutes(mux)
 		
 		logger.Info("HTTP API server starting", zap.String("addr", httpAddr))
 		if err := http.ListenAndServe(httpAddr, mux); err != nil {
